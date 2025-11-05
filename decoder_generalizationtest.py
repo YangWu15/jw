@@ -1,3 +1,10 @@
+"""
+HYBRID GENERALIZATION TEST SCRIPT
+- Loads pre-trained slot decoders.
+- Generates ALL test data ON-THE-FLY using the RNN model.
+- No longer uses any static .pkl files for evaluation.
+- Tests generalization by creating generators for L=7, 11, 14, 16.
+"""
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
@@ -5,17 +12,19 @@ import pandas as pd
 import numpy as np
 import pickle
 import os
-from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import seaborn as sns
 from collections import Counter
 
-# --- Configuration ---
-# Path to the data file
-DATA_FILE_PATH = "/nfs/nhome/live/jwhittington/yang_project/diffenvrnn1.1/detailed_run_data_by_length.pkl"
+# --- NEW: Imports from training script ---
+import gc
+import random
+import time
+from diffenvrnn1 import StandardGatedRNN, LoopEnvironment # Assumes this file is accessible
 
+# --- Configuration ---
 # The loop length that was USED FOR TRAINING
-LOOP_LENGTH_TO_ANALYZE = 14 # This is the "training" loop length
+LOOP_LENGTH_TO_ANALYZE = 14 
 
 # Loop lengths to TEST on
 TEST_LOOP_LENGTHS = [7, 11, 14, 16]
@@ -24,98 +33,160 @@ TEST_LOOP_LENGTHS = [7, 11, 14, 16]
 HIDDEN_SIZE = 2048
 VOCAB_SIZE = 16
 
-# Decoder Hyperparameters (needed for data loading/model definition)
+# Decoder Hyperparameters
 BATCH_SIZE = 512
-TEST_SPLIT_RATIO = 0.2
 RANDOM_STATE = 42
 
 # Directory to LOAD models from and SAVE analysis to
 BASE_OUTPUT_DIR = "slot_decoders_hybrid"
 
+# --- NEW: Dynamic generation configuration ---
+RNN_MODEL_PATH = "diffenvrnn1.1/model.pth"
+FRESH_DATA_SEQ_LENGTH = 150
+MAX_GENERATION_ATTEMPTS = 1000
+
 # --- Analysis Configuration ---
-# Percentage of top contributing neurons to identify
 TOP_PERCENT_NEURONS = 2.5
 
-def load_and_prepare_data(file_path: str, loop_length: int) -> pd.DataFrame:
+# --- REMOVED: load_and_prepare_data (no longer used) ---
+
+
+# --- NEW: Pasted from slot_decoders_hybrid.py ---
+class HybridOnDemandGenerator:
     """
-    Loads data for a specific loop_length from the pickle file,
-    creates shifted target columns, THEN filters for valid targets and t >= L-1.
-    
-    CRITICAL: Shifting must happen BEFORE filtering to preserve historical data!
+    Generates loops on-demand with FULL vectorization.
+    NO pre-generation, NO reuse - fresh data every call!
+    Produces data for ALL decoders at once.
     """
-    print(f"--- Loading and Preparing Data for L={loop_length} ---")
-    
-    with open(file_path, 'rb') as f:
-        all_data = pickle.load(f)
-
-    if loop_length not in all_data:
-        print(f"Warning: Loop length {loop_length} not found in data file.")
-        return pd.DataFrame()
-
-    df = pd.DataFrame(all_data[loop_length])
-    print(f"Loaded {len(df)} total records for L={loop_length}.")
-
-    # CRITICAL FIX: Create shifted targets FIRST, using ALL data
-    print(f"Creating target columns for each slot (1 to {loop_length})...")
-    for k in range(1, loop_length + 1):
-        shift_amount = k - 1
-        # Shift within each batch BEFORE any filtering
-        df[f'target_slot_{k}'] = (
-            df.groupby('batch_idx')['obs'].shift(shift_amount)
-        )
-    
-    # NOW filter: keep rows where t >= L-1 AND all targets are valid
-    print(f"Filtering to keep timestep >= {loop_length - 1} with valid targets...")
-    df_filtered = df[df['timestep'] >= (loop_length - 1)].copy()
-    
-    initial_rows = len(df_filtered)
-    df_filtered.dropna(inplace=True)
-    print(f"Removed {initial_rows - len(df_filtered)} rows with NaN targets after shifting.")
-    
-    # Convert targets to integers
-    for k in range(1, loop_length + 1):
-        df_filtered[f'target_slot_{k}'] = df_filtered[f'target_slot_{k}'].astype(np.int64)
-
-    print(f"Final prepared dataset for L={loop_length} has {len(df_filtered)} samples.")
-    
-    # Verification
-    if len(df_filtered) > 0:
-        print("\n--- Verification Sample ---")
-        # Check first batch
-        first_batch = df_filtered[df_filtered['batch_idx'] == df_filtered['batch_idx'].min()].head(10)
-        print("First batch (first 10 rows after filtering):")
-        print(first_batch[['batch_idx', 'timestep', 'obs', 'target_slot_1', 'target_slot_5', 
-                          f'target_slot_{loop_length}']].to_string(index=False))
+    def __init__(self, loop_length, rnn_model, env, device, phase='test', seed=None):
+        self.loop_length = loop_length
+        self.rnn_model = rnn_model
+        self.env = env
+        self.device = device
+        self.phase = phase
         
-        # Verify correctness
-        print("\nVerifying temporal correctness:")
-        for k in [1, 5, loop_length]:
-            if f'target_slot_{k}' in first_batch.columns:
-                shift_amount = k - 1
-                # Check if target matches obs from shift_amount steps ago
-                first_valid_idx = shift_amount
-                if first_valid_idx < len(first_batch):
-                    current_row = first_batch.iloc[first_valid_idx]
-                    if shift_amount > 0:
-                        target_row = first_batch.iloc[0]
-                        expected = target_row['obs']
-                        actual = current_row[f'target_slot_{k}']
-                        status = "✓" if expected == actual else "✗"
-                        print(f"  Slot {k:2d}: {status} (expected={expected}, actual={actual})")
+        # Track loops we've already used (as tuples for hashing)
+        self.used_loops = set()
+        
+        # Statistics
+        self.total_generated = 0
+        self.failed_attempts = 0
+        
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
     
-    return df_filtered
+    def _generate_unique_loops_batch(self, batch_size):
+        """
+        Generate multiple unique loops at once.
+        Returns list of loops or None if can't generate enough.
+        """
+        batch_loops = []
+        attempts = 0
+        
+        while len(batch_loops) < batch_size and attempts < MAX_GENERATION_ATTEMPTS:
+            # Generate more than needed to account for duplicates
+            num_to_generate = min((batch_size - len(batch_loops)) * 2, 100)
+            
+            # VECTORIZED: Generate multiple loops at once
+            candidate_loops = []
+            for _ in range(num_to_generate):
+                loop = list(np.random.choice(
+                    self.env.observation_bank, 
+                    size=self.loop_length, 
+                    replace=False
+                ))
+                candidate_loops.append(loop)
+            
+            # Filter for uniqueness
+            for loop in candidate_loops:
+                loop_tuple = tuple(loop)
+                if loop_tuple not in self.used_loops:
+                    self.used_loops.add(loop_tuple)
+                    batch_loops.append(loop)
+                    if len(batch_loops) >= batch_size:
+                        break
+            
+            attempts += num_to_generate
+        
+        if len(batch_loops) < batch_size:
+            self.failed_attempts += 1
+            
+        self.total_generated += len(batch_loops)
+        return batch_loops if batch_loops else None
+    
+    def sample_batch(self, batch_size):
+        """
+        Generate a batch of loops ON-DEMAND and process them through the RNN.
+        Returns features and targets for ALL slots.
+        CRITICAL: This generates FRESH data every call - no reuse!
+        """
+        # Generate fresh loops for this batch
+        batch_loops = self._generate_unique_loops_batch(batch_size)
+        
+        if batch_loops is None or len(batch_loops) == 0:
+            print(f"Warning: Could not generate unique loops for {self.phase} L={self.loop_length}")
+            return None, None
+        
+        actual_batch_size = len(batch_loops)
+        
+        # Now process this batch through the RNN (only ONCE per call)
+        with torch.no_grad():
+            obs_seq, vel_seq, target_seq, loop_lengths = self.env.generate_batch(
+                batch_loops, actual_batch_size, FRESH_DATA_SEQ_LENGTH
+            )
+            obs_seq = obs_seq.to(self.device)
+            vel_seq = vel_seq.to(self.device)
+            target_seq = target_seq.to(self.device)
+            
+            _, _, _, data_log = self.rnn_model(
+                obs_seq, vel_seq, target_seq, loop_lengths, collect_data=True
+            )
+
+        # ========================================
+        # VECTORIZED target extraction!
+        # ========================================
+        
+        # Filter valid timesteps
+        valid_records = [r for r in data_log if r['timestep'] >= (self.loop_length - 1)]
+        
+        if len(valid_records) == 0:
+            return None, None
+        
+        # Extract batch indices and timesteps
+        batch_indices = torch.tensor([r['batch_idx'] for r in valid_records], 
+                                     dtype=torch.long, device=self.device)
+        timesteps = torch.tensor([r['timestep'] for r in valid_records], 
+                                 dtype=torch.long, device=self.device)
+        
+        # Stack all hidden states at once
+        hidden_states_np = np.stack([r['hidden_state'] for r in valid_records])
+        X_batch = torch.from_numpy(hidden_states_np).float().to(self.device)
+        
+        # VECTORIZED target extraction - NO PYTHON LOOPS!
+        k_offsets = torch.arange(0, self.loop_length, device=self.device)  # [0, 1, ..., L-1]
+        target_timesteps = timesteps.unsqueeze(1) - k_offsets.unsqueeze(0)  # [N, L]
+        
+        batch_idx_expanded = batch_indices.unsqueeze(1).expand(-1, self.loop_length)  # [N, L]
+        
+        # Gather all targets at once for ALL slots!
+        Y_batch = obs_seq[batch_idx_expanded, target_timesteps].long()  # [N, L]
+        
+        # Clean up
+        del obs_seq, vel_seq, target_seq, data_log
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        return X_batch, Y_batch
+# --- END: Pasted Class ---
 
 
-# --- 2. Decoder Model Definition (FIXED to match training script) ---
+# --- Decoder Model Definition (FIXED to match training script) ---
 class DecoderMLP(nn.Sequential):
     """
     FIXED: Now inherits from nn.Sequential (not nn.Module with a 'layers' attribute)
     to match the state dict structure saved by the training script.
-    
-    The training script saves individual nn.Sequential modules with keys like:
-    "0.weight", "2.weight", "4.weight", etc.
-    
-    This class structure matches that exactly.
     """
     def __init__(self, input_size: int, output_size: int):
         super().__init__(
@@ -126,7 +197,7 @@ class DecoderMLP(nn.Sequential):
             nn.Linear(2048, output_size)
         )
 
-# --- 3. Analysis Text/Plotting Functions (Unchanged) ---
+# --- Analysis Text/Plotting Functions (Unchanged) ---
 def save_analysis_to_text(analysis_data: dict, shared_indices: set, save_path: str):
     print(f"\n--- Saving Detailed Analysis to {save_path} ---")
     with open(save_path, 'w') as f:
@@ -150,7 +221,6 @@ def analyze_decoder_weights(model_path: str, top_percent: float) -> set:
         raise ValueError("top_percent must be between 0 and 100.")
     k = int(round(HIDDEN_SIZE * (top_percent / 100.0)))
     k = max(1, k)
-    # Access first layer directly (index 0 in Sequential)
     first_layer_weights = model[0].weight.data
     importances = torch.abs(first_layer_weights).sum(dim=0)
     top_indices = torch.topk(importances, k).indices
@@ -220,100 +290,9 @@ def run_and_plot_analysis(base_dir: str, num_slots: int, top_percent: float):
     plt.close()
     print(f"\nSaved neuron contribution heatmap to {plot_path}")
 
-# --- 4. Generalization Evaluation Functions (Unchanged) ---
-def evaluate_decoders_on_loop_length(
-    test_loop_length: int,
-    base_model_dir: str,
-    num_trained_decoders: int,
-    criterion: nn.Module,
-    device: torch.device
-) -> dict:
-    """
-    Loads ALL data for a specific loop length and evaluates the trained decoders.
-    Used for L=7, 11, 16.
-    """
-    print(f"--- Evaluating decoders on L={test_loop_length} data (Full Dataset) ---")
-    try:
-        # 1. Load and prepare the test data
-        df_test = load_and_prepare_data(DATA_FILE_PATH, test_loop_length)
-        if df_test.empty:
-            print(f"No data found for L={test_loop_length}, skipping evaluation.")
-            return None
-    except Exception as e:
-        print(f"Error loading data for L={test_loop_length}: {e}. Skipping.")
-        return None
+# --- REMOVED: evaluate_decoders_on_loop_length (logic moved to main) ---
 
-    # 2. Determine number of slots to test
-    num_slots_to_test = min(num_trained_decoders, test_loop_length)
-    if num_slots_to_test == 0:
-        print("No slots to test. Skipping.")
-        return None
-        
-    print(f"Will test decoders 1 through {num_slots_to_test} on this data.")
-
-    # 3. Prepare PyTorch data
-    X_test_data = np.vstack(df_test['hidden_state'].values).astype(np.float32)
-    target_cols = [f'target_slot_{k}' for k in range(1, test_loop_length + 1)]
-    Y_test_data = df_test[target_cols].values
-
-    test_dataset = TensorDataset(torch.from_numpy(X_test_data), torch.from_numpy(Y_test_data))
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE * 2) 
-
-    per_slot_results = []
-    total_loss_all_slots = 0
-    total_acc_all_slots = 0
-
-    # 4. Loop through each relevant decoder
-    for k in range(1, num_slots_to_test + 1):
-        slot_index = k - 1
-        model_path = os.path.join(base_model_dir, f'slot_{k:02d}', 'decoder.pth')
-
-        if not os.path.exists(model_path):
-            print(f"Warning: Model for slot {k} not found at {model_path}. Skipping slot.")
-            continue
-
-        model = DecoderMLP(input_size=HIDDEN_SIZE, output_size=VOCAB_SIZE).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device))
-        model.eval()
-
-        total_test_loss, correct_test, total_test = 0, 0, 0
-        with torch.no_grad():
-            for features, all_targets in test_loader:
-                targets = all_targets[:, slot_index].to(device)
-                features = features.to(device)
-                
-                outputs = model(features)
-                loss = criterion(outputs, targets)
-                total_test_loss += loss.item()
-                _, predicted = torch.max(outputs.data, 1)
-                total_test += targets.size(0)
-                correct_test += (predicted == targets).sum().item()
-        
-        avg_test_loss = total_test_loss / len(test_loader)
-        test_accuracy = correct_test / total_test
-        
-        per_slot_results.append({'slot': k, 'loss': avg_test_loss, 'accuracy': test_accuracy})
-        total_loss_all_slots += avg_test_loss
-        total_acc_all_slots += test_accuracy
-        
-        print(f"   L={test_loop_length}, Slot={k}: Acc={test_accuracy:.4f}, Loss={avg_test_loss:.4f}")
-
-    if not per_slot_results:
-        print(f"No results generated for L={test_loop_length}.")
-        return None
-
-    # 5. Calculate overall averages
-    overall_avg_loss = total_loss_all_slots / len(per_slot_results)
-    overall_avg_accuracy = total_acc_all_slots / len(per_slot_results)
-
-    print(f"Overall for L={test_loop_length}: Avg Acc={overall_avg_accuracy:.4f}, Avg Loss={overall_avg_loss:.4f}")
-    
-    return {
-        'overall_loss': overall_avg_loss,
-        'overall_acc': overall_avg_accuracy,
-        'per_slot_results': per_slot_results
-    }
-
+# --- Generalization Plotting Functions (Unchanged) ---
 def plot_and_save_generalization(results_by_length: dict, save_dir: str):
     """
     Plots the OVERALL (averaged) accuracy and loss across different test loop lengths.
@@ -356,9 +335,6 @@ def plot_and_save_generalization(results_by_length: dict, save_dir: str):
     plt.close()
     print(f"Saved generalization plot to {filepath}")
 
-# ******************************************************
-# *** NEW FUNCTION: Save generalization results to text ***
-# ******************************************************
 def save_generalization_results_to_text(results_by_length: dict, save_dir: str):
     """
     Saves the detailed generalization results (overall and per-slot) to a text file.
@@ -420,7 +396,6 @@ def plot_and_save_per_slot_generalization(results_by_length: dict, save_dir: str
     plt.ylim(0, 1.05)
     
     if max_slot > 0:
-        # Ensure x-ticks are integers from 1 to max_slot
         # Use LOOP_LENGTH_TO_ANALYZE as the max, since L=14 defines the full x-axis
         ticks = np.arange(1, LOOP_LENGTH_TO_ANALYZE + 1)
         plt.xticks(ticks)
@@ -432,13 +407,15 @@ def plot_and_save_per_slot_generalization(results_by_length: dict, save_dir: str
     print(f"Saved per-slot generalization plot to {filepath}")
 
 
-# --- 5. Main Evaluation Script ---
+# --- 5. Main Evaluation Script (HEAVILY MODIFIED) ---
 def main():
     """
-    Main function to orchestrate evaluation and analysis of PRE-TRAINED decoders.
+    Main function to orchestrate evaluation and analysis of PRE-TRAINED decoders
+    using ON-THE-FLY data generation.
     """
     print("="*60)
     print("--- STARTING DECODER EVALUATION & ANALYSIS SCRIPT ---")
+    print("--- (Using ON-THE-FLY Data Generation) ---")
     print(f"Models expected in: {BASE_OUTPUT_DIR}")
     print("="*60 + "\n")
 
@@ -447,25 +424,21 @@ def main():
     print(f"Using device: {device}\n")
     criterion = nn.CrossEntropyLoss()
     
-    # --- 1. Re-create L=14 Test Split ---
-    print(f"--- 1. Loading L={LOOP_LENGTH_TO_ANALYZE} data to re-create test split ---")
-    prepared_df = load_and_prepare_data(DATA_FILE_PATH, LOOP_LENGTH_TO_ANALYZE)
-
-    if prepared_df.empty:
-        print(f"No data available for L={LOOP_LENGTH_TO_ANALYZE}. Exiting.")
-        return
-
-    X = np.vstack(prepared_df['hidden_state'].values).astype(np.float32)
-    target_cols = [f'target_slot_{k}' for k in range(1, LOOP_LENGTH_TO_ANALYZE + 1)]
-    Y = prepared_df[target_cols].values
-
-    _, X_test_L14, _, Y_test_L14 = train_test_split(
-        X, Y, test_size=TEST_SPLIT_RATIO, random_state=RANDOM_STATE, shuffle=True
+    # --- 1. Load RNN Model and Environment ---
+    print(f"Loading RNN from {RNN_MODEL_PATH}...")
+    rnn_model = StandardGatedRNN(hidden_size=HIDDEN_SIZE, vocab_size=VOCAB_SIZE).to(device)
+    rnn_model.load_state_dict(torch.load(RNN_MODEL_PATH, map_location=device))
+    rnn_model.eval()
+    print("✓ RNN loaded")
+    
+    env = LoopEnvironment(
+        observation_bank=list(range(VOCAB_SIZE)),
+        loop_lengths=TEST_LOOP_LENGTHS,
+        velocities=[1]
     )
-    print(f"Re-created L={LOOP_LENGTH_TO_ANALYZE} test set with {X_test_L14.shape[0]} samples.\n")
-    del X, Y, prepared_df # Free up memory
+    print("✓ Environment created")
 
-    # --- 2. Generalization Testing ---
+    # --- 2. Generalization Testing (Now uses live generation) ---
     print("\n" + "="*60)
     print("--- 2. STARTING GENERALIZATION TESTING ---")
     print(f"Models trained on L={LOOP_LENGTH_TO_ANALYZE} will be tested on {TEST_LOOP_LENGTHS}.")
@@ -474,77 +447,90 @@ def main():
     generalization_results = {}
 
     for l_test in TEST_LOOP_LENGTHS:
-        if l_test == LOOP_LENGTH_TO_ANALYZE:
-            # Special case: Evaluate on the held-out L=14 test set
-            print(f"--- Evaluating decoders on L={l_test} data (Held-out Test Set) ---")
+        print(f"--- Evaluating decoders on L={l_test} data (Live Generation) ---")
+        
+        # Determine how many of our 14 decoders to test
+        # e.g., for L=7, we only test decoders 1-7
+        # e.g., for L=16, we test all 14 decoders
+        num_slots_to_test = min(LOOP_LENGTH_TO_ANALYZE, l_test)
+
+        # 1. Create a generator for this specific loop length
+        test_gen = HybridOnDemandGenerator(
+            l_test, rnn_model, env, device, 
+            phase=f'test_L{l_test}', 
+            seed=RANDOM_STATE + l_test # Use different seed per length
+        )
+        
+        # 2. Generate a large batch of test data on-the-fly
+        # (Increase BATCH_SIZE * N for a more stable evaluation)
+        X_test, Y_test_all_slots = test_gen.sample_batch(BATCH_SIZE * 4)
+
+        if X_test is None:
+            print(f"Could not generate test data for L={l_test}. Skipping.")
+            continue
             
-            test_dataset_l14 = TensorDataset(torch.from_numpy(X_test_L14), torch.from_numpy(Y_test_L14))
-            test_loader_l14 = DataLoader(test_dataset_l14, batch_size=BATCH_SIZE * 2)
+        print(f"Generated {X_test.shape[0]} test samples for L={l_test}")
 
-            per_slot_results = []
-            total_loss_all_slots = 0
-            total_acc_all_slots = 0
+        # 3. Create a DataLoader for this test batch
+        test_dataset = TensorDataset(X_test, Y_test_all_slots)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE * 2)
+
+        per_slot_results = []
+        total_loss_all_slots = 0
+        total_acc_all_slots = 0
+        
+        # 4. Evaluate each relevant slot decoder (1 to num_slots_to_test)
+        for k in range(1, num_slots_to_test + 1):
+            slot_index = k - 1
+            model_path = os.path.join(BASE_OUTPUT_DIR, f'slot_{k:02d}', 'decoder.pth')
             
-            for k in range(1, LOOP_LENGTH_TO_ANALYZE + 1):
-                slot_index = k - 1
-                model_path = os.path.join(BASE_OUTPUT_DIR, f'slot_{k:02d}', 'decoder.pth')
-                if not os.path.exists(model_path):
-                    print(f"Warning: Model for slot {k} not found. Skipping.")
-                    continue
-                
-                model = DecoderMLP(input_size=HIDDEN_SIZE, output_size=VOCAB_SIZE).to(device)
-                model.load_state_dict(torch.load(model_path, map_location=device))
-                model.eval()
-
-                total_test_loss, correct_test, total_test = 0, 0, 0
-                with torch.no_grad():
-                    for features, all_targets in test_loader_l14:
-                        targets = all_targets[:, slot_index].to(device)
-                        features = features.to(device)
-                        
-                        outputs = model(features)
-                        loss = criterion(outputs, targets)
-                        total_test_loss += loss.item()
-                        _, predicted = torch.max(outputs.data, 1)
-                        total_test += targets.size(0)
-                        correct_test += (predicted == targets).sum().item()
-                
-                avg_test_loss = total_test_loss / len(test_loader_l14)
-                test_accuracy = correct_test / total_test
-                per_slot_results.append({'slot': k, 'loss': avg_test_loss, 'accuracy': test_accuracy})
-                total_loss_all_slots += avg_test_loss
-                total_acc_all_slots += test_accuracy
-                print(f"   L={l_test}, Slot={k}: Acc={test_accuracy:.4f}, Loss={avg_test_loss:.4f}")
-
-            # Note: We divide by the number of *successful* results, not just LOOP_LENGTH_TO_ANALYZE
-            # This avoids an error if a model file was missing
-            num_results = len(per_slot_results) if per_slot_results else 1
-            overall_avg_loss = total_loss_all_slots / num_results
-            overall_avg_accuracy = total_acc_all_slots / num_results
-            print(f"Overall for L={l_test}: Avg Acc={overall_avg_accuracy:.4f}, Avg Loss={overall_avg_loss:.4f}")
+            if not os.path.exists(model_path):
+                print(f"Warning: Model for slot {k} not found. Skipping.")
+                continue
             
-            generalization_results[l_test] = {
-                'overall_loss': overall_avg_loss,
-                'overall_acc': overall_avg_accuracy,
-                'per_slot_results': per_slot_results
-            }
+            model = DecoderMLP(input_size=HIDDEN_SIZE, output_size=VOCAB_SIZE).to(device)
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            model.eval()
 
-        else:
-            # For L=7, 11, 16, load all their data and test
-            results = evaluate_decoders_on_loop_length(
-                test_loop_length=l_test,
-                base_model_dir=BASE_OUTPUT_DIR,
-                num_trained_decoders=LOOP_LENGTH_TO_ANALYZE,
-                criterion=criterion,
-                device=device
-            )
-            if results:
-                generalization_results[l_test] = results
+            total_test_loss, correct_test, total_test = 0, 0, 0
+            with torch.no_grad():
+                for features, all_targets in test_loader:
+                    # all_targets shape is [N, l_test]
+                    # We correctly select the k-th target (index k-1)
+                    targets = all_targets[:, slot_index].to(device)
+                    features = features.to(device)
+                    
+                    outputs = model(features)
+                    loss = criterion(outputs, targets)
+                    total_test_loss += loss.item()
+                    _, predicted = torch.max(outputs.data, 1)
+                    total_test += targets.size(0)
+                    correct_test += (predicted == targets).sum().item()
+            
+            avg_test_loss = total_test_loss / len(test_loader)
+            test_accuracy = correct_test / total_test
+            per_slot_results.append({'slot': k, 'loss': avg_test_loss, 'accuracy': test_accuracy})
+            total_loss_all_slots += avg_test_loss
+            total_acc_all_slots += test_accuracy
+            print(f"   L={l_test}, Slot={k}: Acc={test_accuracy:.4f}, Loss={avg_test_loss:.4f}")
+
+        if not per_slot_results:
+            print(f"No results for L={l_test}. Skipping.")
+            continue
+            
+        # 5. Calculate and store overall results for this loop length
+        num_results = len(per_slot_results)
+        overall_avg_loss = total_loss_all_slots / num_results
+        overall_avg_accuracy = total_acc_all_slots / num_results
+        print(f"Overall for L={l_test}: Avg Acc={overall_avg_accuracy:.4f}, Avg Loss={overall_avg_loss:.4f}")
+        
+        generalization_results[l_test] = {
+            'overall_loss': overall_avg_loss,
+            'overall_acc': overall_avg_accuracy,
+            'per_slot_results': per_slot_results
+        }
         print("-" * 50 + "\n")
 
-    # ****************************************************
-    # *** MODIFIED SECTION: Call new save/plot functions ***
-    # ****************************************************
 
     # --- 3. Save Generalization Results to Text ---
     save_generalization_results_to_text(generalization_results, BASE_OUTPUT_DIR)
@@ -555,8 +541,9 @@ def main():
     # --- 5. Plot Per-Slot Generalization Results ---
     plot_and_save_per_slot_generalization(generalization_results, BASE_OUTPUT_DIR)
 
-    # --- 6. Run Neuron Analysis ---
-    # This analysis is still based on the L=14 decoders
+    # --- 6. Run Neuron Analysis (Unchanged) ---
+    # This analysis is based on the L=14 decoders' weights, 
+    # which is independent of data generation.
     run_and_plot_analysis(BASE_OUTPUT_DIR, LOOP_LENGTH_TO_ANALYZE, TOP_PERCENT_NEURONS)
     
     print("\n" + "="*60)
